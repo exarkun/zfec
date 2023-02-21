@@ -38,7 +38,7 @@ import Data.Word (Word8)
 import Foreign.C.Types
 import Foreign.ForeignPtr
 import Foreign.Marshal.Alloc
-import Foreign.Marshal.Array (advancePtr, withArray)
+import Foreign.Marshal.Array (advancePtr, pokeArray, withArray)
 import Foreign.Ptr
 import Foreign.Storable (poke, sizeOf)
 import System.IO (IOMode (..), withFile)
@@ -121,22 +121,16 @@ uintCArray :: [Int] -> ((Ptr CUInt) -> IO a) -> IO a
 uintCArray xs f = withArray (map fromIntegral xs) f
 
 -- | Convert a list of ByteStrings to an array of pointers to their data
-byteStringsToArray :: [B.ByteString] -> ((Ptr (Ptr Word8)) -> IO a) -> IO a
-byteStringsToArray inputs f = do
-    let l = length inputs
-    allocaBytes
-        (l * sizeOf (undefined :: Ptr Word8))
-        ( \array -> do
-            let inner _ [] = f array
-                inner array' (bs : bss) =
-                    BU.unsafeUseAsCString
-                        bs
-                        ( \ptr -> do
-                            poke array' $ castPtr ptr
-                            inner (advancePtr array' 1) bss
-                        )
-            inner array inputs
-        )
+byteStringsToArray :: [B.ByteString] -> (Ptr (Ptr Word8) -> IO a) -> IO a
+byteStringsToArray inputs f =
+    allocaBytes (length inputs * sizeOf (undefined :: Ptr Word8)) $ \array -> do
+        inner array array inputs
+  where
+    inner front _ [] = f front
+    inner front pos (bs : bss) =
+        BU.unsafeUseAsCString bs $ \ptr -> do
+            poke pos $ castPtr ptr
+            inner front (advancePtr pos 1) bss
 
 -- | Return True iff all the given ByteStrings are the same length
 allByteStringsSameLength :: [B.ByteString] -> Bool
@@ -151,20 +145,14 @@ createByteStringArray ::
     Int ->
     -- | the size of each buffer
     Int ->
-    ((Ptr (Ptr Word8)) -> IO ()) ->
+    (Ptr (Ptr Word8) -> IO ()) ->
     IO [B.ByteString]
 createByteStringArray n size f = do
-    allocaBytes
-        (n * sizeOf (undefined :: Ptr Word8))
-        ( \array -> do
-            allocaBytes
-                (n * size)
-                ( \ptr -> do
-                    mapM_ (\i -> poke (advancePtr array i) (advancePtr ptr (size * i))) [0 .. (n - 1)]
-                    f array
-                    mapM (\i -> B.packCStringLen (castPtr $ advancePtr ptr (i * size), size)) [0 .. (n - 1)]
-                )
-        )
+    allocaBytes (n * sizeOf (undefined :: Ptr Word8)) $ \array ->
+        allocaBytes (n * size) $ \ptr -> do
+            mapM_ (\i -> poke (advancePtr array i) (advancePtr ptr (size * i))) [0 .. (n - 1)]
+            f array
+            mapM (\i -> B.packCStringLen (castPtr $ advancePtr ptr (i * size), size)) [0 .. (n - 1)]
 
 {- | Generate the secondary blocks from a list of the primary blocks. The
    primary blocks must be in order and all of the same size. There must be
@@ -179,29 +167,33 @@ encode ::
 encode (FECParams params k n) inblocks
     | length inblocks /= k = error "Wrong number of blocks to FEC encode"
     | not (allByteStringsSameLength inblocks) = error "Not all inputs to FEC encode are the same length"
-    | otherwise =
-        unsafePerformIO
-            ( do
-                let sz = B.length $ head inblocks
-                withForeignPtr
-                    params
-                    ( \cfec -> do
-                        byteStringsToArray
-                            inblocks
-                            ( \src -> do
-                                createByteStringArray
-                                    (n - k)
-                                    sz
-                                    ( \fecs -> do
-                                        uintCArray
-                                            [k .. (n - 1)]
-                                            ( \block_nums -> do
-                                                _encode cfec src fecs block_nums (fromIntegral (n - k)) $ fromIntegral sz
-                                            )
-                                    )
-                            )
-                    )
-            )
+    | otherwise = unsafePerformIO $ withEncodeBuffers params k n inblocks _encode
+
+-- Call the encode function with all of its buffers set up for it.  Return the
+-- output buffers as ByteStrings.
+withEncodeBuffers ::
+    -- The FEC parameters.
+    ForeignPtr CFEC ->
+    -- K
+    Int ->
+    -- N
+    Int ->
+    -- The individual blocks.  The length must be K.
+    [B.ByteString] ->
+    -- The low-level encode function.
+    (Ptr CFEC -> Ptr (Ptr Word8) -> Ptr (Ptr Word8) -> Ptr CUInt -> CSize -> CSize -> IO ()) ->
+    -- The values in the output buffer after the low-level encode function has
+    -- run.
+    IO [B.ByteString]
+withEncodeBuffers params k n inblocks f =
+    withForeignPtr params $ \cfec' ->
+        byteStringsToArray inblocks $ \src ->
+            createByteStringArray numSecondary sz $ \fecs ->
+                uintCArray [k .. (n - 1)] $ \block_nums ->
+                    f cfec' src fecs block_nums (fromIntegral numSecondary) (fromIntegral sz)
+  where
+    sz = B.length $ head inblocks
+    numSecondary = n - k
 
 -- | A sort function for tagged assoc lists
 sortTagged :: [(Int, a)] -> [(Int, a)]
@@ -231,40 +223,40 @@ decode ::
     -- | a list the @k@ primary blocks
     [B.ByteString]
 decode (FECParams params k n) inblocks
-    | length (nub $ map fst inblocks) /= length (inblocks) = error "Duplicate input blocks in FEC decode"
-    | any (\f -> f < 0 || f >= n) $ map fst inblocks = error "Invalid block numbers in FEC decode"
+    | length (nub $ map fst inblocks) /= length inblocks = error "Duplicate input blocks in FEC decode"
+    | any ((\f -> f < 0 || f >= n) . fst) inblocks = error "Invalid block numbers in FEC decode"
     | length inblocks /= k = error "Wrong number of blocks to FEC decode"
     | not (allByteStringsSameLength $ map snd inblocks) = error "Not all inputs to FEC decode are same length"
-    | otherwise =
-        unsafePerformIO
-            ( do
-                let sz = B.length $ snd $ head inblocks
-                    inblocks' = reorderPrimaryBlocks k inblocks
-                    presentBlocks = map fst inblocks'
-                withForeignPtr
-                    params
-                    ( \cfec -> do
-                        byteStringsToArray
-                            (map snd inblocks')
-                            ( \src -> do
-                                b <-
-                                    createByteStringArray
-                                        (n - k)
-                                        sz
-                                        ( \out -> do
-                                            uintCArray
-                                                presentBlocks
-                                                ( \block_nums -> do
-                                                    _decode cfec src out block_nums $ fromIntegral sz
-                                                )
-                                        )
-                                let blocks = [0 .. (n - 1)] \\ presentBlocks
-                                    tagged = zip blocks b
-                                    allBlocks = sortTagged $ tagged ++ inblocks'
-                                return $ take k $ map snd allBlocks
-                            )
-                    )
-            )
+    | otherwise = unsafePerformIO $ withDecodeBuffers params k n inblocks _decode
+
+withDecodeBuffers ::
+    -- The FEC parameters.
+    ForeignPtr CFEC ->
+    -- K
+    Int ->
+    -- N
+    Int ->
+    -- The tagged output blocks to decode.  The length must be K.
+    [(Int, B.ByteString)] ->
+    -- The low-level decode function.
+    (Ptr CFEC -> Ptr (Ptr Word8) -> Ptr (Ptr Word8) -> Ptr CUInt -> CSize -> IO ()) ->
+    -- The values in the output buffer after the low-level decode function has
+    -- run.
+    IO [B.ByteString]
+withDecodeBuffers params k n inblocks f =
+    withForeignPtr params $ \cfec' ->
+        byteStringsToArray (map snd inblocks') $ \src -> do
+            b <- createByteStringArray (n - k) sz $ \out ->
+                uintCArray presentBlocks $ \block_nums ->
+                    f cfec' src out block_nums (fromIntegral sz)
+            let tagged = zip blocks b
+                allBlocks = sortTagged $ tagged ++ inblocks'
+            return $ take k $ map snd allBlocks
+  where
+    sz = B.length $ snd $ head inblocks
+    inblocks' = reorderPrimaryBlocks k inblocks
+    presentBlocks = map fst inblocks'
+    blocks = [0 .. (n - 1)] \\ presentBlocks
 
 {- | Break a ByteString into @n@ parts, equal in length to the original, such
    that all @n@ are required to reconstruct the original, but having less
